@@ -1,0 +1,7 @@
+/bin/
+/target/
+/doc/
+/test-output/
+/build/
+.DS_Store
+.idea/*

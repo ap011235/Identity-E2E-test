@@ -1,0 +1,144 @@
+version: 2.1
+
+docker_ruby_image: &docker_ruby_image
+  docker:
+    - image: circleci/ruby:2.6.5-stretch-node
+      environment:
+        - TZ: "/usr/share/zoneinfo/Europe/London"
+        - DX_CLI_URL: https://developer.salesforce.com/media/salesforce-cli/sfdx/channels/stable/sfdx-linux-x64.tar.xz
+
+docker_jdk_image: &docker_jdk_image
+  docker:
+    - image: cimg/openjdk:17.0.2
+
+jobs:
+  create_scratch_org:
+    <<: *docker_ruby_image
+    steps:
+      - checkout
+      - run: curl -o- https://raw.githubusercontent.com/creationix/nvm/v0.33.8/install.sh | bash
+      - run: git clone git@github.com:singletracksystems/Singletrack-Core.git
+      - run: echo export PACKAGE_MAIN_DIR=Singletrack-Core/SingletrackDev >> $BASH_ENV
+      - run: echo export ORG_USERNAME=circle_build_${CIRCLE_BUILD_NUM}_${RANDOM} >> $BASH_ENV
+      - run: openssl enc -nosalt -aes-256-cbc -d -in .circleci/server.key.enc -out .circleci/server.key -base64 -K $DECRYPTION_KEY -iv $DECRYPTION_IV
+      - run: mkdir $PACKAGE_MAIN_DIR/.circleci
+      - run: cp .circleci/server.key $PACKAGE_MAIN_DIR/.circleci
+      - run: sudo apt-get update -qq && sudo apt-get install -y build-essential nodejs ant openjdk-8-jdk jq
+      - run: cd Singletrack-Core && bundle install --path=vendor/bundle
+      - run: cd Singletrack-Core/SingletrackAssets && rm -rf node_modules
+      - run:
+          name: Build Resources
+          command: cd $PACKAGE_MAIN_DIR && ant buildResources
+          no_output_timeout: 1h
+      - run: mkdir ~/sfdx && wget $DX_CLI_URL
+      - run: tar xJf sfdx-linux-x64.tar.xz -C ~/sfdx --strip-components 1
+      - run: echo export PATH=~/sfdx/bin:$PATH >> $BASH_ENV
+      - run: sfdx auth:jwt:grant --clientid $HUB_CONSUMER_KEY --jwtkeyfile .circleci/server.key --username $HUB_SFDX_USER --setdefaultdevhubusername -a hub
+      - run:
+          name: Create org
+          command: |
+            cd $PACKAGE_MAIN_DIR
+            for I in 1 2 3; do if (sfdx force:org:create -s -f config/project-scratch-def.json username=${ORG_USERNAME}@singletrack.com -a $ORG_USERNAME -d 1 --wait 10); then break; fi; done
+            sfdx force:config:set defaultusername=${ORG_USERNAME}@singletrack.com
+            sfdx force:user:password:generate
+            echo export ORG_PASSWORD=$(sfdx force:user:display --json | jq '.result.password') >> $BASH_ENV
+            echo export ORG_INSTANCE_URL=$(sfdx force:user:display --json | jq '.result.instanceUrl') >> $BASH_ENV
+            echo export ORG_ACCESS_TOKEN=$(sfdx force:user:display --json | jq '.result.accessToken') >> $BASH_ENV
+      - run: cp -r .circleci/SingletrackCMS/settings $PACKAGE_MAIN_DIR/singletrack/main/default
+      - run: cp -r Singletrack-Core/lib/layouts $PACKAGE_MAIN_DIR/singletrack/main/default
+      - run:
+          name: Push Source
+          command: cd $PACKAGE_MAIN_DIR && sfdx force:source:push -u $ORG_USERNAME@singletrack.com
+          no_output_timeout: 1h
+      - run:
+          name: Set workspace config
+          command: |
+            mkdir -p workspace
+            echo ${ORG_USERNAME}@singletrack.com > workspace/org-username
+            echo $ORG_PASSWORD > workspace/org-password
+            echo $ORG_INSTANCE_URL > workspace/org-instance-url
+            echo $ORG_ACCESS_TOKEN > workspace/org-access-token
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - org-username
+            - org-password
+            - org-instance-url
+            - org-access-token
+
+  run_tests:
+    <<: *docker_jdk_image
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - checkout
+      - run:
+          name: Set test config
+          command: |
+            export ORG_USERNAME=$(cat /tmp/workspace/org-username) >> $BASH_ENV
+            export ORG_PASSWORD=$(cat /tmp/workspace/org-password) >> $BASH_ENV
+            export ORG_INSTANCE_URL=$(cat /tmp/workspace/org-instance-url) >> $BASH_ENV
+            awk -v val=$ORG_USERNAME 'BEGIN{FS=OFS=" = "} $1 == "test.username"{$2=val} 1' ./Automation/src/config/test.properties > tmp && mv tmp ./Automation/src/config/test.properties
+            awk -v val=$ORG_PASSWORD 'BEGIN{FS=OFS=" = "} $1 == "test.password"{$2=val} 1' ./Automation/src/config/test.properties > tmp && mv tmp ./Automation/src/config/test.properties
+            awk -v val=$ORG_INSTANCE_URL 'BEGIN{FS=OFS=" = "} $1 == "sites.url"{$2=val} 1' ./Automation/src/config/test.properties > tmp && mv tmp ./Automation/src/config/test.properties
+            awk -v val=true 'BEGIN{FS=OFS=" = "} $1 == "test.RunRemotely"{$2=val} 1' ./Automation/src/config/test.properties > tmp && mv tmp ./Automation/src/config/test.properties
+            cat ./Automation/src/config/test.properties
+      - run:
+          name: Run all tests
+          command: cd Automation && mvn verify
+          no_output_timeout: 2h
+      - run:
+          name: Save artifacts
+          command: |
+            mkdir -p ~/test-artifacts/
+            find . -type f -regex ".*/target/failsafe-reports/.*" -exec cp {} ~/test-artifacts/ \;
+          when: always
+      - store_artifacts:
+          path: ~/test-artifacts
+      - run:
+          name: Save test results
+          command: |
+            mkdir -p ~/test-results/junit/
+            find . -type f -regex ".*/target/failsafe-reports/junitreports/.*xml" -exec cp {} ~/test-results/junit/ \;
+          when: always
+      - store_test_results:
+          path: ~/test-results
+
+  delete_org:
+    <<: *docker_ruby_image
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - checkout
+      - run:
+          name: Get workspace data
+          command: |
+            echo export ORG_USERNAME=$(cat /tmp/workspace/org-username) >> $BASH_ENV
+            echo export ORG_PASSWORD=$(cat /tmp/workspace/org-password) >> $BASH_ENV
+            echo export ORG_INSTANCE_URL=$(cat /tmp/workspace/org-instance-url) >> $BASH_ENV
+            echo export SFDX_ACCESS_TOKEN=$(cat /tmp/workspace/org-access-token) >> $BASH_ENV
+      - run: mkdir ~/sfdx && wget $DX_CLI_URL
+      - run: tar xJf sfdx-linux-x64.tar.xz -C ~/sfdx --strip-components 1
+      - run: echo export PATH=~/sfdx/bin:$PATH >> $BASH_ENV
+      - run: openssl enc -nosalt -aes-256-cbc -d -in .circleci/server.key.enc -out .circleci/server.key -base64 -K $DECRYPTION_KEY -iv $DECRYPTION_IV
+      - run: sfdx auth:jwt:grant --clientid $HUB_CONSUMER_KEY --jwtkeyfile .circleci/server.key --username $HUB_SFDX_USER --setdefaultdevhubusername -a hub
+      - run: sfdx auth:accesstoken:store --instanceurl $ORG_INSTANCE_URL -s -p
+      - run: sfdx force:org:delete -u $ORG_USERNAME -p
+
+workflows:
+  qa_automation:
+    triggers:
+      - schedule:
+          cron: "0 0 * * *"
+          filters:
+            branches:
+              only:
+                - master
+    jobs:
+      - create_scratch_org
+      - run_tests:
+          requires:
+            - create_scratch_org
+      - delete_org:
+          requires:
+            - run_tests

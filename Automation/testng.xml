@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE suite SYSTEM "http://testng.org/testng-1.0.dtd">
+<suite name="Suite">
+    <test name="Create Auto Type And Method And Log CA">
+        <classes>
+            <class name="tests.Smoke.CreateAutoTypeAndMethodAndLogCA"/>
+        </classes>
+    </test>
+    <test name="Projects">
+        <classes>
+            <class name="tests.Regression.Projects.newProject">
+                <methods>
+                    <include name="checkProjectTabsExist"/>
+                </methods>
+            </class>
+        </classes>
+    </test>
+</suite>
+
+
+      
+      
+      
+      
